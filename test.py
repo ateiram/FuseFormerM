@@ -107,7 +107,15 @@ def main_worker():
     model = net.InpaintGenerator().to(device)
     model_path = args.ckpt
     data = torch.load(args.ckpt, map_location=device)
+
+    # To change the transformer blocks that are being stuck
+    key_blocks = []
+    for i in range(8,8):
+        key_blocks.append('transformer.' + str(i))
+    data = {k: v for k, v in data.items() if not any(block_index in k for block_index in key_blocks)}
+
     model.load_state_dict(data)
+
     print('loading from: {}'.format(args.ckpt))
     model.eval()
 
