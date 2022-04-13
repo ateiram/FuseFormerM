@@ -22,8 +22,9 @@ class Dataset(torch.utils.data.Dataset):
             vid_lst = os.listdir(vid_lst_prefix)
             self.video_names = [os.path.join(vid_lst_prefix, name) for name in vid_lst]
 
-
-
+            sem_lst_prefix = os.path.join(args['data_root'], args['name'], split+'_all_frames/semantic_maps')
+            sem_lst = os.listdir(sem_lst_prefix)
+            self.semantic_map_names = [os.path.join(sem_lst_prefix, name) for name in sem_lst]
         self._to_tensors = transforms.Compose([
             Stack(),
             ToTorchFormatTensor(), ])
@@ -41,24 +42,32 @@ class Dataset(torch.utils.data.Dataset):
 
     def load_item(self, index):
         video_name = self.video_names[index]
+        semantic_map_name = self.semantic_map_names[index]
         all_frames = [os.path.join(video_name, name) for name in sorted(os.listdir(video_name))]
+        all_semantic_maps = [os.path.join(semantic_map_name, name) for name in sorted(os.listdir(semantic_map_name))]
         all_masks = create_random_shape_with_random_motion(
             len(all_frames), imageHeight=self.h, imageWidth=self.w)
         ref_index = get_ref_index(len(all_frames), self.sample_length)
         # read video frames
         frames = []
+        semantic_maps = []
         masks = []
+        # all_masks[0].save("test.jpg")
         for idx in ref_index:
             img = Image.open(all_frames[idx]).convert('RGB')
             img = img.resize(self.size)
             frames.append(img)
+            sem_img = Image.open(all_semantic_maps[idx]).convert('RGB')
+            sem_img = sem_img.resize(self.size)
+            semantic_maps.append(sem_img)
             masks.append(all_masks[idx])
         if self.split == 'train':
-            frames = GroupRandomHorizontalFlip()(frames)
+            frames, semantic_maps = GroupRandomHorizontalFlip()(frames, semantic_maps)
         # To tensors
         frame_tensors = self._to_tensors(frames)*2.0 - 1.0
+        semantic_map_tensors = self._to_tensors(semantic_maps) * 2.0 - 1.0
         mask_tensors = self._to_tensors(masks)
-        return frame_tensors, mask_tensors
+        return frame_tensors, mask_tensors, semantic_map_tensors
 
 
 def get_ref_index(length, sample_length):

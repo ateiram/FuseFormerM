@@ -31,11 +31,10 @@ from core.utils import Stack, ToTorchFormatTensor
 from model.i3d import InceptionI3d
 from scipy import linalg
 
-
 parser = argparse.ArgumentParser(description="FuseFormer")
 parser.add_argument("-v", "--video", type=str, required=False)
-parser.add_argument("-m", "--mask",   type=str, required=False)
-parser.add_argument("-c", "--ckpt",   type=str, required=True)
+parser.add_argument("-m", "--mask", type=str, required=False)
+parser.add_argument("-c", "--ckpt", type=str, required=True)
 parser.add_argument("--model", type=str, default='fuseformer')
 parser.add_argument("--dataset", type=str, default='davis')
 parser.add_argument("--width", type=int, default=432)
@@ -50,7 +49,6 @@ parser.add_argument("--use_mp4", action='store_true')
 parser.add_argument("--dump_results", action='store_true')
 args = parser.parse_args()
 
-
 w, h = args.width, args.height
 ref_length = args.step  # ref_step
 num_ref = args.num_ref
@@ -61,6 +59,7 @@ i3d_model = None
 _to_tensors = transforms.Compose([
     Stack(),
     ToTorchFormatTensor()])
+
 
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     """Numpy implementation of the Frechet Distance.
@@ -115,6 +114,7 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     return (diff.dot(diff) + np.trace(sigma1) +  # NOQA
             np.trace(sigma2) - 2 * tr_covmean)
 
+
 def get_fid_score(real_activations, fake_activations):
     """
     Given two distribution of features, compute the FID score between them
@@ -125,6 +125,7 @@ def get_fid_score(real_activations, fake_activations):
     s2 = np.cov(fake_activations, rowvar=False)
     return calculate_frechet_distance(m1, s1, m2, s2)
 
+
 def init_i3d_model():
     global i3d_model
     if i3d_model is not None:
@@ -132,12 +133,13 @@ def init_i3d_model():
 
     print("[Loading I3D model for FID score ..]")
     i3d_model_weight = './checkpoints/i3d_rgb_imagenet.pt'
-    #if not os.path.exists(i3d_model_weight):
+    # if not os.path.exists(i3d_model_weight):
     #    os.mkdir(os.path.dirname(i3d_model_weight))
     #    urllib.request.urlretrieve('http://www.cmlab.csie.ntu.edu.tw/~zhe2325138/i3d_rgb_imagenet.pt', i3d_model_weight)
     i3d_model = InceptionI3d(400, in_channels=3, final_endpoint='Logits')
     i3d_model.load_state_dict(torch.load(i3d_model_weight))
     i3d_model.to(torch.device('cuda:0'))
+
 
 def get_i3d_activations(batched_video, target_endpoint='Logits', flatten=True, grad_enabled=False):
     """
@@ -172,6 +174,7 @@ def get_i3d_activations(batched_video, target_endpoint='Logits', flatten=True, g
 
     return feat
 
+
 def get_frame_mask_list(args):
     if args.dataset == 'davis':
         data_root = "./data/DATASET_DAVIS"
@@ -190,7 +193,8 @@ def get_frame_mask_list(args):
     print("[Finish building dataset {}]".format(args.dataset))
     return frame_list, mask_list
 
-# sample reference frames from the whole video 
+
+# sample reference frames from the whole video
 def get_ref_index(f, neighbor_ids, length):
     ref_index = []
     if num_ref == -1:
@@ -198,9 +202,9 @@ def get_ref_index(f, neighbor_ids, length):
             if not i in neighbor_ids:
                 ref_index.append(i)
     else:
-        start_idx = max(0, f - ref_length * (num_ref//2))
-        end_idx = min(length, f + ref_length * (num_ref//2))
-        for i in range(start_idx, end_idx+1, ref_length):
+        start_idx = max(0, f - ref_length * (num_ref // 2))
+        end_idx = min(length, f + ref_length * (num_ref // 2))
+        for i in range(start_idx, end_idx + 1, ref_length):
             if not i in neighbor_ids:
                 ref_index.append(i)
                 if len(ref_index) >= num_ref:
@@ -213,38 +217,39 @@ def read_mask(mpath):
     masks = []
     mnames = os.listdir(mpath)
     mnames.sort()
-    for m in mnames: 
+    for m in mnames:
         m = Image.open(os.path.join(mpath, m))
         m = m.resize((w, h), Image.NEAREST)
         m = np.array(m.convert('L'))
         m = np.array(m > 0).astype(np.uint8)
         m = cv2.dilate(m, cv2.getStructuringElement(
             cv2.MORPH_CROSS, (3, 3)), iterations=4)
-        masks.append(Image.fromarray(m*255))
+        masks.append(Image.fromarray(m * 255))
     return masks
 
 
 #  read frames from video 
 def read_frame_from_videos(vname):
-
     lst = os.listdir(vname)
     lst.sort()
-    fr_lst = [vname+'/'+name for name in lst]
+    fr_lst = [vname + '/' + name for name in lst]
     frames = []
     for fr in fr_lst:
         image = cv2.imread(fr)
         image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-        frames.append(image.resize((w,h)))
-    return frames       
+        frames.append(image.resize((w, h)))
+    return frames
+
 
 def create_square_masks(video_length, h, w):
     masks = []
     for i in range(video_length):
         this_mask = np.zeros((h, w))
-        this_mask[int(h/4):h-int(h/4), int(w/4):w-int(w/4)] = 1
-        this_mask = Image.fromarray((this_mask*255).astype(np.uint8))
+        this_mask[int(h / 4):h - int(h / 4), int(w / 4):w - int(w / 4)] = 1
+        this_mask = Image.fromarray((this_mask * 255).astype(np.uint8))
         masks.append(this_mask.convert('L'))
     return masks
+
 
 def get_res_list(dir):
     folders = sorted(os.listdir(dir))
@@ -276,7 +281,7 @@ def main_worker():
     real_i3d_activations = []
 
     model_name = args.ckpt.split("/")[-1].split(".")[0]
-    dump_results_dir = model_name+"_scratch_davis_results"
+    dump_results_dir = model_name + "_scratch_davis_results"
     if args.dump_results:
         if not os.path.exists(dump_results_dir):
             os.mkdir(dump_results_dir)
@@ -289,37 +294,37 @@ def main_worker():
 
         frames_PIL = read_frame_from_videos(frame_list[video_no])
         video_length = len(frames_PIL)
-        imgs = _to_tensors(frames_PIL).unsqueeze(0)*2-1
+        imgs = _to_tensors(frames_PIL).unsqueeze(0) * 2 - 1
         frames = [np.array(f).astype(np.uint8) for f in frames_PIL]
 
-        masks = read_mask(mask_list[video_no])    
+        masks = read_mask(mask_list[video_no])
         binary_masks = [np.expand_dims((np.array(m) != 0).astype(np.uint8), 2) for m in masks]
         masks = _to_tensors(masks).unsqueeze(0)
-    
+
         imgs, masks = imgs.to(device), masks.to(device)
-        comp_frames = [None]*video_length
+        comp_frames = [None] * video_length
 
         for f in range(0, video_length, neighbor_stride):
-            neighbor_ids = [i for i in range(max(0, f-neighbor_stride), min(video_length, f+neighbor_stride+1))]
+            neighbor_ids = [i for i in range(max(0, f - neighbor_stride), min(video_length, f + neighbor_stride + 1))]
             ref_ids = get_ref_index(f, neighbor_ids, video_length)
             len_temp = len(neighbor_ids) + len(ref_ids)
-            selected_imgs = imgs[:1, neighbor_ids+ref_ids, :, :, :]
-            selected_masks = masks[:1, neighbor_ids+ref_ids, :, :, :]
+            selected_imgs = imgs[:1, neighbor_ids + ref_ids, :, :, :]
+            selected_masks = masks[:1, neighbor_ids + ref_ids, :, :, :]
             print(len_temp)
             with torch.no_grad():
-                input_imgs = selected_imgs*(1-selected_masks)
+                input_imgs = selected_imgs * (1 - selected_masks)
                 pred_img = model(input_imgs)
                 pred_img = (pred_img + 1) / 2
-                pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy()*255
+                pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
                 for i in range(len(neighbor_ids)):
                     idx = neighbor_ids[i]
                     img = np.array(pred_img[i]).astype(
-                        np.uint8)*binary_masks[idx] + frames[idx] * (1-binary_masks[idx])
+                        np.uint8) * binary_masks[idx] + frames[idx] * (1 - binary_masks[idx])
                     if comp_frames[idx] is None:
                         comp_frames[idx] = img
                     else:
                         comp_frames[idx] = comp_frames[idx].astype(
-                            np.float32)*0.5 + img.astype(np.float32)*0.5
+                            np.float32) * 0.5 + img.astype(np.float32) * 0.5
         ssim, psnr, s_psnr = 0., 0., 0.
         comp_PIL = []
         for f in range(video_length):
@@ -340,21 +345,18 @@ def main_worker():
         ssim_all += ssim
         s_psnr_all += s_psnr
         video_length_all += (video_length)
-        if video_no % 50 ==1:
-            print("ssim {}, psnr {}".format(ssim_all/video_length_all, s_psnr_all/video_length_all))
+        if video_no % 50 == 1:
+            print("ssim {}, psnr {}".format(ssim_all / video_length_all, s_psnr_all / video_length_all))
         # FVID computation
         imgs = _to_tensors(comp_PIL).unsqueeze(0).to(device)
         gts = _to_tensors(frames_PIL).unsqueeze(0).to(device)
         output_i3d_activations.append(get_i3d_activations(imgs).cpu().numpy().flatten())
         real_i3d_activations.append(get_i3d_activations(gts).cpu().numpy().flatten())
     fid_score = get_fid_score(real_i3d_activations, output_i3d_activations)
-    print("[Finish evaluating, ssim is {}, psnr is {}]".format(ssim_all/video_length_all, s_psnr_all/video_length_all))
+    print("[Finish evaluating, ssim is {}, psnr is {}]".format(ssim_all / video_length_all,
+                                                               s_psnr_all / video_length_all))
     print("[fvid score is {}]".format(fid_score))
 
 
 if __name__ == '__main__':
     main_worker()
-
-
-import torch
-print(torch.cuda.is_available())

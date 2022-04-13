@@ -18,22 +18,25 @@ matplotlib.use('agg')
 
 class GroupRandomHorizontalFlip(object):
     """Randomly horizontally flips the given PIL.Image with a probability of 0.5
+    Changed so that semantic map and frame are changed the same way
     """
 
     def __init__(self, is_flow=False):
         self.is_flow = is_flow
 
-    def __call__(self, img_group, is_flow=False):
+    def __call__(self, img_group, img_group_maps, is_flow=False):
         v = random.random()
         if v < 0.5:
             ret = [img.transpose(Image.FLIP_LEFT_RIGHT) for img in img_group]
+            ret_maps = [img_map.transpose(Image.FLIP_LEFT_RIGHT) for img_map in img_group_maps]
             if self.is_flow:
                 for i in range(0, len(ret), 2):
                     # invert flow pixel values when flipping
                     ret[i] = ImageOps.invert(ret[i])
-            return ret
+                    ret_maps[i] = ImageOps.invert(ret_maps[i])
+            return ret, ret_maps
         else:
-            return img_group
+            return img_group, img_group_maps
 
 
 class Stack(object):

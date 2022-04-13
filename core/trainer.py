@@ -29,26 +29,25 @@ class Trainer():
         self.train_dataset = Dataset(config['data_loader'], split='train')
         self.train_sampler = None
         self.train_args = config['trainer']
-
         if config['distributed']:
             self.train_sampler = DistributedSampler(
                 self.train_dataset,
-                num_replicas=config['world_size'], 
+                num_replicas=config['world_size'],
                 rank=config['global_rank'])
         self.train_loader = DataLoader(
             self.train_dataset,
-            batch_size=self.train_args['batch_size'], #// config['world_size'],
-            shuffle=(self.train_sampler is None), 
-            num_workers=self.train_args['num_workers'], 
+            batch_size=self.train_args['batch_size'],  # // config['world_size'], #TODO how can this affect?
+            shuffle=(self.train_sampler is None),
+            num_workers=self.train_args['num_workers'],
             sampler=self.train_sampler)
 
-        # set loss functions 
+        # set loss functions
         self.adversarial_loss = AdversarialLoss(type=self.config['losses']['GAN_LOSS'])
         self.adversarial_loss = self.adversarial_loss.to(self.config['device'])
         self.l1_loss = nn.L1Loss()
 
         # setup models including generator and discriminator
-        net = importlib.import_module('model.'+config['model']['net'])
+        net = importlib.import_module('model.' + config['model']['net'])
         self.netG = net.InpaintGenerator()
         self.netG = self.netG.to(self.config['device'])
         if not self.config['model']['no_dis']:
@@ -56,29 +55,29 @@ class Trainer():
                 in_channels=3, use_sigmoid=config['losses']['GAN_LOSS'] != 'hinge')
             self.netD = self.netD.to(self.config['device'])
         self.optimG = torch.optim.Adam(
-            self.netG.parameters(), 
+            self.netG.parameters(),
             lr=config['trainer']['lr'],
             betas=(self.config['trainer']['beta1'], self.config['trainer']['beta2']))
         if not self.config['model']['no_dis']:
             self.optimD = torch.optim.Adam(
-                self.netD.parameters(), 
+                self.netD.parameters(),
                 lr=config['trainer']['lr'],
                 betas=(self.config['trainer']['beta1'], self.config['trainer']['beta2']))
         self.load()
 
         if config['distributed']:
             self.netG = DDP(
-                self.netG, 
-                device_ids=[self.config['local_rank']], 
+                self.netG,
+                device_ids=[self.config['local_rank']],
                 output_device=self.config['local_rank'],
-                broadcast_buffers=True, 
+                broadcast_buffers=True,
                 find_unused_parameters=True)
             if not self.config['model']['no_dis']:
                 self.netD = DDP(
-                    self.netD, 
-                    device_ids=[self.config['local_rank']], 
+                    self.netD,
+                    device_ids=[self.config['local_rank']],
                     output_device=self.config['local_rank'],
-                    broadcast_buffers=True, 
+                    broadcast_buffers=True,
                     find_unused_parameters=False)
 
         # set summary writer
@@ -95,10 +94,10 @@ class Trainer():
     def get_lr(self):
         return self.optimG.param_groups[0]['lr']
 
-     # learning rate scheduler, step
+    # learning rate scheduler, step
     def adjust_learning_rate(self):
-        decay = 0.1**(min(self.iteration,
-                          self.config['trainer']['niter']) // self.config['trainer']['niter'])
+        decay = 0.1 ** (min(self.iteration,
+                            self.config['trainer']['niter']) // self.config['trainer']['niter'])
         new_lr = self.config['trainer']['lr'] * decay
         if new_lr != self.get_lr():
             for param_group in self.optimG.param_groups:
@@ -113,7 +112,7 @@ class Trainer():
             self.summary[name] = 0
         self.summary[name] += val
         if writer is not None and self.iteration % 100 == 0:
-            writer.add_scalar(name, self.summary[name]/100, self.iteration)
+            writer.add_scalar(name, self.summary[name] / 100, self.iteration)
             self.summary[name] = 0
 
     # load netG and netD
@@ -192,11 +191,11 @@ class Trainer():
 
         os.makedirs('logs', exist_ok=True)
         logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
-                    datefmt='%a, %d %b %Y %H:%M:%S',
-                    filename='logs/{}.log'.format(self.config['save_dir'].split('/')[-1]),
-                    filemode='w')
-        
+                            format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
+                            datefmt='%a, %d %b %Y %H:%M:%S',
+                            filename='logs/{}.log'.format(self.config['save_dir'].split('/')[-1]),
+                            filemode='w')
+
         while True:
             self.epoch += 1
             if self.config['distributed']:
@@ -211,17 +210,21 @@ class Trainer():
     def _train_epoch(self, pbar):
         device = self.config['device']
 
-        for frames, masks in self.train_loader:
+        for frames, masks, semantic_maps in self.train_loader:
             self.adjust_learning_rate()
             self.iteration += 1
 
-            frames, masks = frames.to(device), masks.to(device)
+            frames, masks, semantic_maps = frames.to(device), masks.to(device), semantic_maps.to(device)
             b, t, c, h, w = frames.size()
             masked_frame = (frames * (1 - masks).float())
+            masked_semantic_map = (semantic_maps * (1 - masks).float())
             pred_img = self.netG(masked_frame)
-            frames = frames.view(b*t, c, h, w)
-            masks = masks.view(b*t, 1, h, w)
-            comp_img = frames*(1.-masks) + masks*pred_img
+            pred_map = self.netG(masked_semantic_map)  # TODO this part
+            frames = frames.view(b * t, c, h, w)
+            masks = masks.view(b * t, 1, h, w)
+            semantic_maps = semantic_maps.view(b * t, 3, h, w)  # TODO, number of channels is 1 or 3
+            comp_img = frames * (1. - masks) + masks * pred_img
+            comp_map = frames * (1. - masks) + masks * pred_map
 
             gen_loss = 0
             dis_loss = 0
@@ -250,18 +253,18 @@ class Trainer():
                     self.gen_writer, 'loss/gan_loss', gan_loss.item())
 
             # generator l1 loss
-            hole_loss = self.l1_loss(pred_img*masks, frames*masks)
+            hole_loss = self.l1_loss(pred_img * masks, frames * masks)
             hole_loss = hole_loss / torch.mean(masks) * self.config['losses']['hole_weight']
-            gen_loss += hole_loss 
+            gen_loss += hole_loss
             self.add_summary(
                 self.gen_writer, 'loss/hole_loss', hole_loss.item())
 
-            valid_loss = self.l1_loss(pred_img*(1-masks), frames*(1-masks))
-            valid_loss = valid_loss / torch.mean(1-masks) * self.config['losses']['valid_weight']
-            gen_loss += valid_loss 
+            valid_loss = self.l1_loss(pred_img * (1 - masks), frames * (1 - masks))
+            valid_loss = valid_loss / torch.mean(1 - masks) * self.config['losses']['valid_weight']
+            gen_loss += valid_loss
             self.add_summary(
                 self.gen_writer, 'loss/valid_loss', valid_loss.item())
-            
+
             self.optimG.zero_grad()
             gen_loss.backward()
             self.optimG.step()
@@ -281,12 +284,18 @@ class Trainer():
 
                 if self.iteration % self.train_args['log_freq'] == 0:
                     if not self.config['model']['no_dis']:
-                        logging.info('[Iter {}] d: {:.4f}; g: {:.4f}; hole: {:.4f}; valid: {:.4f}'.format(self.iteration, dis_loss.item(), gan_loss.item(), hole_loss.item(), valid_loss.item()))
+                        logging.info(
+                            '[Iter {}] d: {:.4f}; g: {:.4f}; hole: {:.4f}; valid: {:.4f}'.format(self.iteration,
+                                                                                                 dis_loss.item(),
+                                                                                                 gan_loss.item(),
+                                                                                                 hole_loss.item(),
+                                                                                                 valid_loss.item()))
                     else:
-                        logging.info('[Iter {}] hole: {:.4f}; valid: {:.4f}'.format(self.iteration, hole_loss.item(), valid_loss.item()))
+                        logging.info('[Iter {}] hole: {:.4f}; valid: {:.4f}'.format(self.iteration, hole_loss.item(),
+                                                                                    valid_loss.item()))
             # saving models
             if self.iteration % self.train_args['save_freq'] == 0:
-                self.save(int(self.iteration//self.train_args['save_freq']))
+                self.save(int(self.iteration // self.train_args['save_freq']))
             if self.iteration > self.train_args['iterations']:
                 break
 
