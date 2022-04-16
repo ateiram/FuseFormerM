@@ -58,7 +58,7 @@ class Dataset(torch.utils.data.Dataset):
             img = img.resize(self.size)
             frames.append(img)
             sem_img = Image.open(all_semantic_maps[idx]).convert('RGB')
-            sem_img = sem_img.resize(self.size)
+            sem_img = sem_img.resize(self.size, resample=0)
             semantic_maps.append(sem_img)
             masks.append(all_masks[idx])
         if self.split == 'train':
