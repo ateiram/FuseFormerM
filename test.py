@@ -109,17 +109,17 @@ def main_worker():
     data = torch.load(args.ckpt, map_location=device)
 
     # To change the transformer blocks that are being stuck
-    key_blocks = []
-    for i in range(8,8):
-        key_blocks.append('transformer.' + str(i))
-    data = {k: v for k, v in data.items() if not any(block_index in k for block_index in key_blocks)}
+    # key_blocks = []
+    # for i in range(8,8):
+    #     key_blocks.append('transformer.' + str(i))
+    # data = {k: v for k, v in data.items() if not any(block_index in k for block_index in key_blocks)}
 
     model.load_state_dict(data)
 
     print('loading from: {}'.format(args.ckpt))
     model.eval()
 
-    # prepare datset, encode all frames into deep space 
+    # prepare datset, encode all frames into deep space
     frames = read_frame_from_videos(args)
     video_length = len(frames)
     imgs = _to_tensors(frames).unsqueeze(0)*2-1
@@ -145,7 +145,7 @@ def main_worker():
         with torch.no_grad():
             masked_imgs = selected_imgs*(1-selected_masks)
             pred_img = model(masked_imgs)
-            pred_img = (pred_img + 1) / 2
+            # pred_img = (pred_img + 1) / 2 #TODO i took this into InpaintGenerator, check if this is ok for the loss
             pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy()*255
             for i in range(len(neighbor_ids)):
                 idx = neighbor_ids[i]
