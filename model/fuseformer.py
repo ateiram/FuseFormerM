@@ -90,7 +90,7 @@ class Encoder(nn.Module):
             nn.LeakyReLU(0.2, inplace=True)
         ])
 
-    def forward(self, x):
+    def forward(self, x, x_sem):
         bt, c, h, w = x.size()
         h, w = h//4, w//4
         out = x
@@ -103,7 +103,20 @@ class Encoder(nn.Module):
                 o = out.view(bt, g, -1, h, w)
                 out = torch.cat([x, o], 2).view(bt, -1, h, w)
             out = layer(out)
-        return out
+
+        with torch.no_grad():
+            out_sem = x_sem
+            for i, layer in enumerate(self.layers):
+                if i == 8:
+                    x0_sem = out_sem
+                if i > 8 and i % 2 == 0:
+                    g_sem = self.group[(i - 8) // 2]
+                    x_sem = x0_sem.view(bt, g_sem, -1, h, w)
+                    o_sem = out_sem.view(bt, g_sem, -1, h, w)
+                    out_sem = torch.cat([x_sem, o_sem], 2).view(bt, -1, h, w)
+                out_sem = layer(out_sem)
+
+        return out, out_sem
 
 
 class InpaintGenerator(BaseNetwork):
@@ -111,7 +124,8 @@ class InpaintGenerator(BaseNetwork):
         super(InpaintGenerator, self).__init__()
         channel = 256
         hidden = 512
-        stack_num = 8
+        stack_num = 6 # from 8 to 6
+        stack_num_swap = 2 # To change the transformer blocks that are being stuck
         num_head = 4
         kernel_size = (7, 7)
         padding = (3, 3)
@@ -126,12 +140,16 @@ class InpaintGenerator(BaseNetwork):
         for _ in range(stack_num):
             blocks.append(TransformerBlock(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
                                            t2t_params=t2t_params))
-        self.transformer = nn.Sequential(*blocks)
+        for _ in range(stack_num_swap):
+            blocks.append(TransformerBlockSWAP(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
+                                               t2t_params=t2t_params))
+        self.transformer = blocks
         self.ss = SoftSplit(channel // 2, hidden, kernel_size, stride, padding, dropout=dropout)
         self.add_pos_emb = AddPosEmb(n_vecs, hidden)
         self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
 
         self.encoder = Encoder()
+        self.to_ndim = To_ndim()
 
         # decoder: decode frames from features
         self.decoder = nn.Sequential(
@@ -147,20 +165,33 @@ class InpaintGenerator(BaseNetwork):
         if init_weights:
             self.init_weights()
 
-    def forward(self, masked_frames):
+    def forward(self, masked_frames, masked_semantic_maps):
         # extracting features
         b, t, c, h, w = masked_frames.size()
         time0 = time.time()
-        enc_feat = self.encoder(masked_frames.view(b * t, c, h, w))
+        enc_feat, enc_feat_sem = self.encoder(masked_frames.view(b * t, c, h, w),
+                                              masked_semantic_maps.view(b * t, c, h, w))
         _, c, h, w = enc_feat.size()
         trans_feat = self.ss(enc_feat, b)
         trans_feat = self.add_pos_emb(trans_feat)
-        trans_feat = self.transformer(trans_feat)
+        trans_feat_sem = self.ss(enc_feat_sem, b)
+        trans_feat_sem = self.add_pos_emb(trans_feat_sem)
+
+        for block in self.transformer[0:6]:
+            trans_feat, trans_feat_sem = block(trans_feat, trans_feat_sem)
+
+        for block in self.transformer[6:8]:
+            trans_feat, trans_feat_sem, trans_comp, trans_comp_sem = block(trans_feat, trans_feat_sem, t) #passed t for sc() before encoder inside the block
+
         trans_feat = self.sc(trans_feat, t)
         enc_feat = enc_feat + trans_feat
+        trans_feat_sem = self.sc(trans_feat_sem, t)
+        enc_feat_sem = enc_feat_sem + trans_feat_sem
         output = self.decoder(enc_feat)
         output = torch.tanh(output)
-        return output
+        output_sem = self.decoder(enc_feat_sem)
+        output_sem = torch.tanh(output_sem)
+        return output, output_sem # we don't actually need the generator return both, right?
 
 
 class deconv(nn.Module):
@@ -338,12 +369,113 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden)
         self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, input):
+        self.attention_sem = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout)
+        self.ffn_sem = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params)
+        self.norm1_sem = nn.LayerNorm(hidden)
+        self.norm2_sem = nn.LayerNorm(hidden)
+        self.dropout_sem = nn.Dropout(p=dropout)
+
+    def forward(self, input, input_sem):
         x = self.norm1(input)
         x = input + self.dropout(self.attention(x))
         y = self.norm2(x)
         x = x + self.ffn(y)
-        return x
+
+        x_sem = self.norm1_sem(input_sem)
+        x_sem = input_sem + self.dropout_sem(self.attention(x_sem))
+        y_sem = self.norm2_sem(x_sem)
+        x_sem = x_sem + self.ffn_sem(y_sem)
+        return x, x_sem
+
+class To_ndim(nn.Module):
+    def __init__(self):
+        super(To_ndim, self).__init__()
+        self.predefined_values = [0/255, 51/255, 102/255, 153/255, 204/255, 255/255]
+        #TODO TO_ASK_VAHRAM here still could be tuples that do not map to any class as they are only 133, here we can get 216
+
+    def forward(self, S):
+        _, c, h, w = S.shape
+        # TODO TO_ASK_VAHRAM , to put identical decoder to sem features,
+        #  it should have the same sizes as in (L188),
+        #  so before ndim() it is passing through sc() and pos_emb(),
+        #  which is adding one more dimension` _
+        C = torch.tensor(self.predefined_values).repeat(_, c, h, w, 1)
+        diff = torch.abs(C.subtract((S.unsqueeze(dim=4))))
+        index = torch.argmin(diff, 4)
+        output = torch.take(C, index)
+        return output
+
+class TransformerBlockSWAP(nn.Module):
+    """
+    Transformer = MultiHead_Attention + Feed_Forward with sublayer connection
+    """
+    def __init__(self, hidden=128, num_head=4, dropout=0.1, n_vecs=None, t2t_params=None,
+                 channel=256, kernel_size=(7, 7), padding=(3, 3), stride=(3, 3), output_size=(60, 108)):
+        super().__init__()
+
+        self.attention = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout)
+        self.ffn = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params)
+        self.norm1 = nn.LayerNorm(hidden)
+        self.norm2 = nn.LayerNorm(hidden)
+        self.dropout = nn.Dropout(p=dropout)
+
+        self.attention_sem = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout)
+        self.ffn_sem = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params)
+        self.norm1_sem = nn.LayerNorm(hidden)
+        self.norm2_sem = nn.LayerNorm(hidden)
+        self.dropout_sem = nn.Dropout(p=dropout)
+
+        # decoder: decode frames from features
+        self.decoder = nn.Sequential(
+            deconv(channel // 2, 128, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            deconv(64, 64, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
+        )
+
+        self.decoder_sem = nn.Sequential(
+            deconv(channel // 2, 128, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            deconv(64, 64, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
+        )
+
+        self.add_pos_emb = AddPosEmb(n_vecs, hidden)
+        self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
+
+    def forward(self, input, input_sem, t):
+        x = self.norm1(input)
+        x = input + self.dropout(self.attention(x))
+        y = self.norm2(x)
+        x = x + self.ffn(y)
+
+        x_sem = self.norm1_sem(input_sem)
+        x_sem = input_sem + self.dropout_sem(self.attention(x_sem))
+        y_sem = self.norm2_sem(x_sem)
+        x_sem = x_sem + self.ffn_sem(y_sem)
+
+        x_ = self.sc(x, t)
+        x_ = self.add_pos_emb(x_)
+        x_ = self.decoder(x_)
+
+        x_sem_ = self.sc(x_sem_, t)
+        x_sem_ = self.add_pos_emb(x_sem_)
+        x_sem_ = self.decoder(x_sem_)
+
+        # RGB images of both are obtained
+
+        x_ = (x_ + 1) / 2
+        x_sem_ = (x_sem_ + 1) / 2
+        # completed sem map passes through the n_ndim()
+        # x_ and x_sem_ are completed images, x and x_sem are features
+        x_sem_ = self.to_ndim(x_sem_)
+        return x, x_sem, x_, x_sem_
 
 
 # ######################################################################
