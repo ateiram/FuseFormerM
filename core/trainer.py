@@ -218,11 +218,11 @@ class Trainer():
             b, t, c, h, w = frames.size()
             masked_frame = (frames * (1 - masks).float())
             masked_semantic_map = (semantic_maps * (1 - masks).float())
-            pred_img = self.netG(masked_frame)
-            pred_map = self.netG(masked_semantic_map)  # TODO this part
+            pred_img, pred_map = self.netG(masked_frame, masked_semantic_map) # semantics are going through no_grad path
+
             frames = frames.view(b * t, c, h, w)
             masks = masks.view(b * t, 1, h, w)
-            semantic_maps = semantic_maps.view(b * t, 3, h, w)  # TODO, number of channels is 1 or 3
+            semantic_maps = semantic_maps.view(b * t, 3, h, w)
             comp_img = frames * (1. - masks) + masks * pred_img
             comp_map = frames * (1. - masks) + masks * pred_map
 
