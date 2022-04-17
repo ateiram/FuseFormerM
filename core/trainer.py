@@ -45,6 +45,7 @@ class Trainer():
         self.adversarial_loss = AdversarialLoss(type=self.config['losses']['GAN_LOSS'])
         self.adversarial_loss = self.adversarial_loss.to(self.config['device'])
         self.l1_loss = nn.L1Loss()
+        self.cross_ent_loss = torch.nn.CrossEntropyLoss()
 
         # setup models including generator and discriminator
         net = importlib.import_module('model.' + config['model']['net'])
@@ -259,6 +260,10 @@ class Trainer():
             self.add_summary(
                 self.gen_writer, 'loss/hole_loss', hole_loss.item())
 
+            # generator cross entropy loss for semantic maps
+            sem_map_loss = self.cross_ent_loss(pred_map * masks, semantic_maps * masks)
+            gen_loss += sem_map_loss
+
             valid_loss = self.l1_loss(pred_img * (1 - masks), frames * (1 - masks))
             valid_loss = valid_loss / torch.mean(1 - masks) * self.config['losses']['valid_weight']
             gen_loss += valid_loss
@@ -275,24 +280,28 @@ class Trainer():
                 if not self.config['model']['no_dis']:
                     pbar.set_description((
                         f"d: {dis_loss.item():.3f}; g: {gan_loss.item():.3f};"
-                        f"hole: {hole_loss.item():.3f}; valid: {valid_loss.item():.3f}")
+                        f"hole: {hole_loss.item():.3f}; valid: {valid_loss.item():.3f}; sem_map: {sem_map_loss.item():.3f}")
                     )
                 else:
                     pbar.set_description((
-                        f"hole: {hole_loss.item():.3f}; valid: {valid_loss.item():.3f}")
+                        f"hole: {hole_loss.item():.3f}; valid: {valid_loss.item():.3f}; sem_map: {sem_map_loss.item():.3f}")
                     )
 
                 if self.iteration % self.train_args['log_freq'] == 0:
                     if not self.config['model']['no_dis']:
                         logging.info(
-                            '[Iter {}] d: {:.4f}; g: {:.4f}; hole: {:.4f}; valid: {:.4f}'.format(self.iteration,
+                            '[Iter {}] d: {:.4f}; g: {:.4f}; hole: {:.4f}; valid: {:.4f}; sem_map: {:.4f}'.format(
+                                                                                                 self.iteration,
                                                                                                  dis_loss.item(),
                                                                                                  gan_loss.item(),
                                                                                                  hole_loss.item(),
-                                                                                                 valid_loss.item()))
+                                                                                                 valid_loss.item(),
+                                                                                                 sem_map_loss.item()))
                     else:
-                        logging.info('[Iter {}] hole: {:.4f}; valid: {:.4f}'.format(self.iteration, hole_loss.item(),
-                                                                                    valid_loss.item()))
+                        logging.info('[Iter {}] hole: {:.4f}; valid: {:.4f}; sem_map: {:.4f}'.format(self.iteration,
+                                                                                                     hole_loss.item(),
+                                                                                                     valid_loss.item(),
+                                                                                                     sem_map_loss.item()))
             # saving models
             if self.iteration % self.train_args['save_freq'] == 0:
                 self.save(int(self.iteration // self.train_args['save_freq']))
