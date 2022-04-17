@@ -450,32 +450,32 @@ class TransformerBlockSWAP(nn.Module):
         self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
 
     def forward(self, input, input_sem, t):
-        x = self.norm1(input)
-        x = input + self.dropout(self.attention(x))
-        y = self.norm2(x)
-        x = x + self.ffn(y)
+        x_feat = self.norm1(input)
+        x_feat = input + self.dropout(self.attention(x_feat))
+        y_feat = self.norm2(x_feat)
+        x_feat = x_feat + self.ffn(y_feat)
 
-        x_sem = self.norm1_sem(input_sem)
-        x_sem = input_sem + self.dropout_sem(self.attention(x_sem))
-        y_sem = self.norm2_sem(x_sem)
-        x_sem = x_sem + self.ffn_sem(y_sem)
+        x_sem_feat = self.norm1_sem(input_sem)
+        x_sem_feat = input_sem+ self.dropout_sem(self.attention(x_sem_feat))
+        y_sem_feat = self.norm2_sem(x_sem_feat)
+        x_sem_feat = x_sem_feat + self.ffn_sem(y_sem_feat)
 
-        x_ = self.sc(x, t)
-        x_ = self.add_pos_emb(x_)
-        x_ = self.decoder(x_)
+        x = self.sc(x_feat, t)
+        x = self.add_pos_emb(x)
+        x = self.decoder(x)
 
-        x_sem_ = self.sc(x_sem_, t)
-        x_sem_ = self.add_pos_emb(x_sem_)
-        x_sem_ = self.decoder(x_sem_)
+        x_sem = self.sc(x_sem_feat, t)
+        x_sem = self.add_pos_emb(x_sem)
+        x_sem = self.decoder(x_sem)
 
         # RGB images of both are obtained
 
-        x_ = (x_ + 1) / 2
-        x_sem_ = (x_sem_ + 1) / 2
+        x = (x + 1) / 2
+        x_sem = (x_sem + 1) / 2
         # completed sem map passes through the n_ndim()
-        # x_ and x_sem_ are completed images, x and x_sem are features
-        x_sem_ = self.to_ndim(x_sem_)
-        return x, x_sem, x_, x_sem_
+        # x and x_sem are completed images, x_feat and x_sem_feat are features
+        x_sem = self.to_ndim(x_sem)
+        return x_feat, x_sem_feat, x, x_sem
 
 
 # ######################################################################
