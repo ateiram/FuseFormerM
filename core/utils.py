@@ -5,10 +5,13 @@ import numpy as np
 from PIL import Image, ImageOps
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import matplotlib
 import matplotlib.patches as patches
 from matplotlib.path import Path
 from matplotlib import pyplot as plt
+from itertools import product
 matplotlib.use('agg')
 
 
@@ -117,12 +120,12 @@ def create_random_shape_with_random_motion(video_length, imageHeight=240, imageW
 
 def get_random_shape(edge_num=9, ratio=0.7, width=432, height=240):
     '''
-      There is the initial point and 3 points per cubic bezier curve. 
+      There is the initial point and 3 points per cubic bezier curve.
       Thus, the curve will only pass though n points, which will be the sharp edges.
       The other 2 modify the shape of the bezier curve.
       edge_num, Number of possibly sharp edges
       points_num, number of points in the Path
-      ratio, (0, 1) magnitude of the perturbation from the unit circle, 
+      ratio, (0, 1) magnitude of the perturbation from the unit circle,
     '''
     points_num = edge_num*3 + 1
     angles = np.linspace(0, 2*np.pi, points_num)
@@ -214,3 +217,30 @@ if __name__ == '__main__':
             cv2.imshow('mask', np.array(m))
             cv2.waitKey(500)
 
+
+class To_ndim(nn.Module):
+    def __init__(self):
+        super(To_ndim, self).__init__()
+        predefined_list = [0 / 255, 51 / 255, 102 / 255, 153 / 255, 204 / 255, 255 / 255]
+        tuples = list(product(predefined_list, repeat=3))
+        tuples.remove((0, 0, 0))
+        self.color_map = np.asarray(tuples[0:133])
+
+    def forward(self, S):
+        _, c, h, w = S.shape
+
+        N, _ = self.color_map.shape
+        assert len(S.shape) == 3 or len(S.shape) == 4
+        if len(S.shape) == 3:
+            S = S.unsqueeze(-1)
+        assert S.shape[-1] == 3 or S.shape[-1] == 1
+        if S.shape[-1] == 1:
+            return F.one_hot(S, num_classes=N)
+
+        bt, w, h, c = S.shape
+
+        C = torch.Tensor(self.color_map).view((1, 1, 1, c, N))  # [1, 1, 1, c, N]
+        mad = torch.abs(C - S.unsqueeze(dim=-1))  # [bt, w, h, c, N]
+        mae = mad.sum(-2)  # [bt, w, h, N]
+        ind = torch.argmin(mae, -1)  # [bt, w, h]
+        return F.one_hot(ind, num_classes=N)  # [bt, w, h, N]

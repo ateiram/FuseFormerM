@@ -9,7 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from core.spectral_norm import spectral_norm as _spectral_norm
-
+from itertools import product
+from core.utils import To_ndim
 
 class BaseNetwork(nn.Module):
     def __init__(self):
@@ -76,7 +77,7 @@ class Encoder(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 256 , kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(256, 384, kernel_size=3, stride=1, padding=1, groups=1),
             nn.LeakyReLU(0.2, inplace=True),
@@ -124,14 +125,15 @@ class InpaintGenerator(BaseNetwork):
         super(InpaintGenerator, self).__init__()
         channel = 256
         hidden = 512
-        stack_num = 6 # from 8 to 6
-        stack_num_swap = 2 # To change the transformer blocks that are being stuck
+        stack_num = 6  # from 8 to 6
+        stack_num_swap = 2  # To change the transformer blocks that are being stuck
         num_head = 4
         kernel_size = (7, 7)
         padding = (3, 3)
         stride = (3, 3)
         output_size = (60, 108)
         blocks = []
+
         dropout = 0.
         t2t_params = {'kernel_size': kernel_size, 'stride': stride, 'padding': padding, 'output_size': output_size}
         n_vecs = 1
@@ -165,7 +167,7 @@ class InpaintGenerator(BaseNetwork):
         if init_weights:
             self.init_weights()
 
-    def forward(self, masked_frames, masked_semantic_maps):
+    def forward(self, masked_frames, masked_semantic_maps, masks):
         # extracting features
         b, t, c, h, w = masked_frames.size()
         time0 = time.time()
@@ -177,21 +179,34 @@ class InpaintGenerator(BaseNetwork):
         trans_feat_sem = self.ss(enc_feat_sem, b)
         trans_feat_sem = self.add_pos_emb(trans_feat_sem)
 
+        sem_results = []
+        img_results = []
+
         for block in self.transformer[0:6]:
             trans_feat, trans_feat_sem = block(trans_feat, trans_feat_sem)
 
         for block in self.transformer[6:8]:
-            trans_feat, trans_feat_sem, trans_comp, trans_comp_sem = block(trans_feat, trans_feat_sem, t) #passed t for sc() before encoder inside the block
+            trans_feat, trans_feat_sem, trans_comp, trans_comp_sem = block(enc_feat_sem,
+                                                                           enc_feat,
+                                                                           trans_feat,
+                                                                           trans_feat_sem,
+                                                                           t, masks)
+            # passed t for sc() before encoder inside the block
+            sem_results.append(trans_comp_sem)  # [bt, 108, 60, 133]
+            img_results.append(trans_comp)  # [bt, 3*k*k, p]
 
-        trans_feat = self.sc(trans_feat, t)
-        enc_feat = enc_feat + trans_feat
-        trans_feat_sem = self.sc(trans_feat_sem, t)
-        enc_feat_sem = enc_feat_sem + trans_feat_sem
-        output = self.decoder(enc_feat)
-        output = torch.tanh(output)
-        output_sem = self.decoder(enc_feat_sem)
-        output_sem = torch.tanh(output_sem)
-        return output, output_sem # we don't actually need the generator return both, right?
+
+        # trans_feat = self.sc(trans_feat, t)
+        # enc_feat = enc_feat + trans_feat
+        # output = self.decoder(enc_feat)
+
+        # trans_feat_sem = self.sc(trans_feat_sem, t)
+        # enc_feat_sem = enc_feat_sem + trans_feat_sem
+        # output_sem = self.decoder(enc_feat_sem)
+        # output_sem = torch.tanh(output_sem)
+
+        # TODO returns two lists of two outputs
+        return img_results, sem_results  # intermediate_sem is a list of two completed maps of two blocks
 
 
 class deconv(nn.Module):
@@ -205,6 +220,22 @@ class deconv(nn.Module):
                           align_corners=True)
         return self.conv(x)
 
+
+class deconvSWAP(nn.Module):
+    def __init__(self, input_channel, output_channel, kernel_size=3, padding=0, scale_factor=1, mode='bilinear'):
+        super().__init__()
+        self.mode = mode
+        self.scale_factor = scale_factor
+        self.conv = nn.Conv2d(input_channel, output_channel,
+                              kernel_size=kernel_size, stride=1, padding=padding)
+
+    def forward(self, x):
+        if self.mode == 'nearest':
+            x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+            return self.conv(x)
+
+        x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode,  align_corners=True)
+        return self.conv(x)
 
 # #############################################################################
 # ############################# Transformer  ##################################
@@ -274,9 +305,11 @@ class SoftComp(nn.Module):
         self.bias = nn.Parameter(torch.zeros((channel, h, w), dtype=torch.float32), requires_grad=True)
 
     def forward(self, x, t):
+
         feat = self.embedding(x)
         b, n, c = feat.size()
         feat = feat.view(b * t, -1, c).permute(0, 2, 1)
+        print("siezes", feat.size())
         feat = self.t2t(feat) + self.bias[None]
         return feat
 
@@ -308,7 +341,6 @@ class MultiHeadedAttention(nn.Module):
         att = att.permute(0, 2, 1, 3).contiguous().view(b, n, c)
         output = self.output_linear(att)
         return output
-
 
 class FeedForward(nn.Module):
     def __init__(self, d_model, p=0.1):
@@ -385,25 +417,10 @@ class TransformerBlock(nn.Module):
         x_sem = input_sem + self.dropout_sem(self.attention(x_sem))
         y_sem = self.norm2_sem(x_sem)
         x_sem = x_sem + self.ffn_sem(y_sem)
+
         return x, x_sem
 
-class To_ndim(nn.Module):
-    def __init__(self):
-        super(To_ndim, self).__init__()
-        self.predefined_values = [0/255, 51/255, 102/255, 153/255, 204/255, 255/255]
-        #TODO TO_ASK_VAHRAM here still could be tuples that do not map to any class as they are only 133, here we can get 216
 
-    def forward(self, S):
-        _, c, h, w = S.shape
-        # TODO TO_ASK_VAHRAM , to put identical decoder to sem features,
-        #  it should have the same sizes as in (L188),
-        #  so before ndim() it is passing through sc() and pos_emb(),
-        #  which is adding one more dimension` _
-        C = torch.tensor(self.predefined_values).repeat(_, c, h, w, 1)
-        diff = torch.abs(C.subtract((S.unsqueeze(dim=4))))
-        index = torch.argmin(diff, 4)
-        output = torch.take(C, index)
-        return output
 
 class TransformerBlockSWAP(nn.Module):
     """
@@ -427,56 +444,122 @@ class TransformerBlockSWAP(nn.Module):
 
         # decoder: decode frames from features
         self.decoder = nn.Sequential(
-            deconv(channel // 2, 128, kernel_size=3, padding=1),
+            deconvSWAP(channel // 2, 128, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            deconv(64, 64, kernel_size=3, padding=1),
+            deconvSWAP(64, 64, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
         )
 
         self.decoder_sem = nn.Sequential(
-            deconv(channel // 2, 128, kernel_size=3, padding=1),
+            deconvSWAP(channel // 2, 128, kernel_size=3, padding=1, mode='nearest'),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            deconv(64, 64, kernel_size=3, padding=1),
+            deconvSWAP(64, 64, kernel_size=3, padding=1, mode='nearest'),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
         )
 
-        self.add_pos_emb = AddPosEmb(n_vecs, hidden)
-        self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
+        self.encoder_to_final_size = nn.Sequential(
+            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2),
+            nn.LeakyReLU(0.2, inplace=True),
+            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
 
-    def forward(self, input, input_sem, t):
+        self.encoder_to_final_size_sem = nn.Sequential(
+            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2, mode='nearest'),
+            nn.LeakyReLU(0.2, inplace=True),
+            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2, mode='nearest'),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        self.add_pos_emb = AddPosEmb(n_vecs, hidden)
+        self.add_pos_emb_sem = AddPosEmb(n_vecs, hidden)
+        self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
+        self.to_ndim = To_ndim()
+        self.t2t = torch.nn.Fold(output_size=output_size, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.swap = SWAP()
+        self.output_size = output_size
+
+    def forward(self, enc_feat_sem, enc_feat, input, input_sem, t, masks):
         x_feat = self.norm1(input)
         x_feat = input + self.dropout(self.attention(x_feat))
         y_feat = self.norm2(x_feat)
         x_feat = x_feat + self.ffn(y_feat)
 
         x_sem_feat = self.norm1_sem(input_sem)
-        x_sem_feat = input_sem+ self.dropout_sem(self.attention(x_sem_feat))
+        x_sem_feat = input_sem + self.dropout_sem(self.attention(x_sem_feat))
         y_sem_feat = self.norm2_sem(x_sem_feat)
         x_sem_feat = x_sem_feat + self.ffn_sem(y_sem_feat)
 
         x = self.sc(x_feat, t)
-        x = self.add_pos_emb(x)
+        x = enc_feat + x
         x = self.decoder(x)
+        x = torch.tanh(x)
 
         x_sem = self.sc(x_sem_feat, t)
-        x_sem = self.add_pos_emb(x_sem)
-        x_sem = self.decoder(x_sem)
+        x_sem = enc_feat_sem + x_sem
+        x_sem = self.decoder_sem(x_sem)
+        x_sem = torch.tanh(x_sem)   # [20, 60, 108, 3]
 
-        # RGB images of both are obtained
+        x_sem_encoded = self.to_ndim(x_sem.permute(0, 3, 2, 1)).permute(0, 2, 1, 3)  # [bt, w, h, N] -> [bt, h, w, N])
 
-        x = (x + 1) / 2
-        x_sem = (x_sem + 1) / 2
-        # completed sem map passes through the n_ndim()
-        # x and x_sem are completed images, x_feat and x_sem_feat are features
-        x_sem = self.to_ndim(x_sem)
+        x = self.swap(x, x_sem_encoded, masks)  # [bt, 3, 60, 108]
+        x = self.encoder_to_final_size(x)  # [bt, 3, 240, 432]
+
+        x_sem = self.encoder_to_final_size_sem(x_sem)  # [20, 3, 60, 108] -> [20, 3, 240, 432]
+        x_sem = self.to_ndim(x_sem.permute(0, 3, 2, 1)).permute(0, 3, 2, 1).float()  # [20, 133, 240, 432]
+
         return x_feat, x_sem_feat, x, x_sem
 
+
+# ############################ SWAP BLOCK ################################
+
+class SWAP(nn.Module):
+    def __init__(self, k=12, stride=(12, 12), padding=(0, 0), N=133):
+        super(SWAP, self).__init__()
+        self.k = k
+        self.N = N
+        self.stride = stride
+        self.padding = padding
+        self.unfold = nn.Unfold(kernel_size=(k, k), stride=stride, padding=padding)
+        self.fold = nn.Fold(output_size=(60, 108), kernel_size=(k, k), stride=stride, padding=padding)
+        self.softmax = nn.Softmax(dim=-1)
+
+
+    def forward(self, I, S, M):
+        orig_I, orig_S, orig_M = I.float(), S.float(), M.float()
+        I, S, M = orig_I.unsqueeze(-1), orig_S.unsqueeze(-1).permute(0, 4, 1, 2, 3), orig_M.unsqueeze(-1)
+        bt, N = I.shape[0], self.N
+        h, w = 240, 432
+
+        U = I * S * M
+        K = I * S * (1 - M)
+
+        K = K.permute(0, 4, 1, 2, 3).reshape(bt * N, 3, h // 4, w // 4)
+        U = U.permute(0, 4, 1, 2, 3).reshape(bt * N, 3, h // 4, w // 4)
+
+        K = self.unfold(K)
+        U = self.unfold(U)
+        _, _, p = K.shape
+
+        W = torch.bmm(torch.transpose(U, 1, 2), K)
+
+        W = F.normalize(W, p=1, dim=-1)
+
+        W = W.unsqueeze(-1).permute(0, 3, 1, 2)
+        K = K.unsqueeze(-2)
+        WK = torch.sum(W * K, -1)
+
+        output = self.fold(WK)
+        output = output.view(bt, N, 3, h // 4, w // 4).sum(1)
+        output = orig_I * (1 - orig_M) + output * orig_M
+        print(output.size())
+        return output
 
 # ######################################################################
 # ######################################################################
