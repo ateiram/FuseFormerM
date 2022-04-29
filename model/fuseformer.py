@@ -254,7 +254,6 @@ class deconvSWAP(nn.Module):
 # ############################# Transformer  ##################################
 # #############################################################################
 
-
 class Attention(nn.Module):
     """
     Compute 'Scaled Dot Product Attention
