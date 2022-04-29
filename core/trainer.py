@@ -46,6 +46,7 @@ class Trainer():
         self.adversarial_loss = self.adversarial_loss.to(self.config['device'])
         self.l1_loss = nn.L1Loss()
         self.cross_ent_loss = torch.nn.CrossEntropyLoss()
+        self.cross_ent_loss = self.cross_ent_loss.to(self.config['device'])
 
         # setup models including generator and discriminator
         net = importlib.import_module('model.' + config['model']['net'])
