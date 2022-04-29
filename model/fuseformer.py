@@ -211,7 +211,7 @@ class InpaintGenerator(BaseNetwork):
             trans_feat = self.ss(enc_feat, b)
             trans_feat = self.add_pos_emb(trans_feat)
 
-        for block in self.transformer[6:8]:
+        for block in self.transformer[5:8]:
             trans_feat, trans_feat_sem = block(trans_feat, trans_feat_sem)
 
         trans_feat = self.sc(trans_feat, t)
@@ -525,6 +525,7 @@ class TransformerBlockSWAP(nn.Module):
         x = self.decoder_to_final_size(x)    # [bt, 3, 240, 432]
 
         x_sem = self.decoder_to_final_size_sem(x_sem)  # [20, 3, 60, 108] -> [20, 3, 240, 432]
+        print(x_sem[0,0,:,:])
         x_sem = self.to_ndim(x_sem.permute(0, 3, 2, 1)).permute(0, 3, 2, 1).float()  # [20, 133, 240, 432]
 
         return x, x_sem

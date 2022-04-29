@@ -274,13 +274,13 @@ class Trainer():
             # generator cross entropy loss for semantic maps
             # TODO check shapes for all outputs that are going inside cross entropy loss
             semantic_maps = To_ndim()(semantic_maps.permute(0, 2, 3, 1))
-            semantic_maps = torch.sum(semantic_maps, -1)
+            semantic_maps = torch.argmax(semantic_maps, -1)
 
             print('sem map shape before loss', semantic_maps.size())  # [20, 240, 432]
             print('pred map shape before loss', pred_map_list[0].size())  # [20, 133, 240, 432]
 
-            sem_map_loss = self.cross_ent_loss(pred_map_list[0], semantic_maps)
-            + self.cross_ent_loss(pred_map_list[1], semantic_maps)
+            sem_map_loss = 0.1 * (self.cross_ent_loss(pred_map_list[0], semantic_maps)
+            + self.cross_ent_loss(pred_map_list[1], semantic_maps))
 
 
             gen_loss += sem_map_loss
