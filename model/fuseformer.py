@@ -91,7 +91,7 @@ class Encoder(nn.Module):
             nn.LeakyReLU(0.2, inplace=True)
         ])
 
-    def forward(self, x, x_sem):
+    def forward(self, x):
         bt, c, h, w = x.size()
         h, w = h//4, w//4
         out = x
@@ -105,19 +105,7 @@ class Encoder(nn.Module):
                 out = torch.cat([x, o], 2).view(bt, -1, h, w)
             out = layer(out)
 
-        with torch.no_grad():
-            out_sem = x_sem
-            for i, layer in enumerate(self.layers):
-                if i == 8:
-                    x0_sem = out_sem
-                if i > 8 and i % 2 == 0:
-                    g_sem = self.group[(i - 8) // 2]
-                    x_sem = x0_sem.view(bt, g_sem, -1, h, w)
-                    o_sem = out_sem.view(bt, g_sem, -1, h, w)
-                    out_sem = torch.cat([x_sem, o_sem], 2).view(bt, -1, h, w)
-                out_sem = layer(out_sem)
-
-        return out, out_sem
+        return out
 
 
 class InpaintGenerator(BaseNetwork):
@@ -125,7 +113,7 @@ class InpaintGenerator(BaseNetwork):
         super(InpaintGenerator, self).__init__()
         channel = 256
         hidden = 512
-        stack_num = 6  # from 8 to 6
+        stack_num = 3
         stack_num_swap = 2  # To change the transformer blocks that are being stuck
         num_head = 4
         kernel_size = (7, 7)
@@ -139,16 +127,23 @@ class InpaintGenerator(BaseNetwork):
         n_vecs = 1
         for i, d in enumerate(kernel_size):
             n_vecs *= int((output_size[i] + 2 * padding[i] - (d - 1) - 1) / stride[i] + 1)
-        for _ in range(stack_num):
+
+
+        for _ in range(stack_num):  # 3
             blocks.append(TransformerBlock(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
                                            t2t_params=t2t_params))
-        for _ in range(stack_num_swap):
+        for _ in range(stack_num_swap):  # 2
             blocks.append(TransformerBlockSWAP(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
                                                t2t_params=t2t_params))
+        for _ in range(stack_num):  # 3
+            blocks.append(TransformerBlock(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
+                                           t2t_params=t2t_params))
         self.transformer = blocks
         self.ss = SoftSplit(channel // 2, hidden, kernel_size, stride, padding, dropout=dropout)
         self.add_pos_emb = AddPosEmb(n_vecs, hidden)
         self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
+        self.stack_num = stack_num
+        self.stack_num_swap = stack_num_swap
 
         self.encoder = Encoder()
         self.to_ndim = To_ndim()
@@ -169,44 +164,62 @@ class InpaintGenerator(BaseNetwork):
 
     def forward(self, masked_frames, masked_semantic_maps, masks):
         # extracting features
-        b, t, c, h, w = masked_frames.size()
+        b, t, c, h, w = masked_frames.size()  # [2, 5, 3, 240, 432]
         time0 = time.time()
-        enc_feat, enc_feat_sem = self.encoder(masked_frames.view(b * t, c, h, w),
-                                              masked_semantic_maps.view(b * t, c, h, w))
-        _, c, h, w = enc_feat.size()
+
+        enc_feat = self.encoder(masked_frames.view(b * t, c, h, w))  # [10, 128, 60, 108]
+        with torch.no_grad():
+            enc_feat_sem = self.encoder(masked_semantic_maps.view(b * t, c, h, w))
+
         trans_feat = self.ss(enc_feat, b)
         trans_feat = self.add_pos_emb(trans_feat)
+
         trans_feat_sem = self.ss(enc_feat_sem, b)
-        trans_feat_sem = self.add_pos_emb(trans_feat_sem)
+        trans_feat_sem = self.add_pos_emb(trans_feat_sem)  # [2, 3600, 512]
 
         sem_results = []
         img_results = []
 
-        for block in self.transformer[0:6]:
+        for block in self.transformer[0:3]:  # 0, 1, 2
             trans_feat, trans_feat_sem = block(trans_feat, trans_feat_sem)
 
+        for block in self.transformer[3:4]:  # 3
+            trans_comp, trans_comp_sem = block(enc_feat_sem,
+                                               enc_feat,
+                                               trans_feat,
+                                               trans_feat_sem,
+                                               t, masks)
+        sem_results.append(trans_comp_sem)
+        img_results.append(trans_comp)
+
+        with torch.no_grad():
+            enc_feat = self.encoder(trans_comp.view(b * t, c, h, w))
+            trans_feat = self.ss(enc_feat, b)
+            trans_feat = self.add_pos_emb(trans_feat)
+
+        for block in self.transformer[4:5]:    # 4
+            trans_comp, trans_comp_sem = block(enc_feat_sem,
+                                               enc_feat,
+                                               trans_feat,
+                                               trans_feat_sem,
+                                               t, masks)
+        sem_results.append(trans_comp_sem)
+        img_results.append(trans_comp)
+
+        with torch.no_grad():
+            enc_feat = self.encoder(trans_comp.view(b * t, c, h, w))
+            trans_feat = self.ss(enc_feat, b)
+            trans_feat = self.add_pos_emb(trans_feat)
+
         for block in self.transformer[6:8]:
-            trans_feat, trans_feat_sem, trans_comp, trans_comp_sem = block(enc_feat_sem,
-                                                                           enc_feat,
-                                                                           trans_feat,
-                                                                           trans_feat_sem,
-                                                                           t, masks)
-            # passed t for sc() before encoder inside the block
-            sem_results.append(trans_comp_sem)  # [bt, 108, 60, 133]
-            img_results.append(trans_comp)  # [bt, 3*k*k, p]
+            trans_feat, trans_feat_sem = block(trans_feat, trans_feat_sem)
 
+        trans_feat = self.sc(trans_feat, t)
+        enc_feat = enc_feat + trans_feat
+        output = self.decoder(enc_feat)
+        output = torch.tanh(output)
 
-        # trans_feat = self.sc(trans_feat, t)
-        # enc_feat = enc_feat + trans_feat
-        # output = self.decoder(enc_feat)
-
-        # trans_feat_sem = self.sc(trans_feat_sem, t)
-        # enc_feat_sem = enc_feat_sem + trans_feat_sem
-        # output_sem = self.decoder(enc_feat_sem)
-        # output_sem = torch.tanh(output_sem)
-
-        # TODO returns two lists of two outputs
-        return img_results, sem_results  # intermediate_sem is a list of two completed maps of two blocks
+        return output, sem_results
 
 
 class deconv(nn.Module):
@@ -305,11 +318,9 @@ class SoftComp(nn.Module):
         self.bias = nn.Parameter(torch.zeros((channel, h, w), dtype=torch.float32), requires_grad=True)
 
     def forward(self, x, t):
-
         feat = self.embedding(x)
         b, n, c = feat.size()
         feat = feat.view(b * t, -1, c).permute(0, 2, 1)
-        print("siezes", feat.size())
         feat = self.t2t(feat) + self.bias[None]
         return feat
 
@@ -463,14 +474,14 @@ class TransformerBlockSWAP(nn.Module):
             nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
         )
 
-        self.encoder_to_final_size = nn.Sequential(
+        self.decoder_to_final_size = nn.Sequential(
             deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2),
             nn.LeakyReLU(0.2, inplace=True),
             deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2),
             nn.LeakyReLU(0.2, inplace=True)
         )
 
-        self.encoder_to_final_size_sem = nn.Sequential(
+        self.decoder_to_final_size_sem = nn.Sequential(
             deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2, mode='nearest'),
             nn.LeakyReLU(0.2, inplace=True),
             deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2, mode='nearest'),
@@ -480,41 +491,44 @@ class TransformerBlockSWAP(nn.Module):
         self.add_pos_emb = AddPosEmb(n_vecs, hidden)
         self.add_pos_emb_sem = AddPosEmb(n_vecs, hidden)
         self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
+        self.encoder = Encoder()
         self.to_ndim = To_ndim()
         self.t2t = torch.nn.Fold(output_size=output_size, kernel_size=kernel_size, stride=stride, padding=padding)
         self.swap = SWAP()
         self.output_size = output_size
 
     def forward(self, enc_feat_sem, enc_feat, input, input_sem, t, masks):
-        x_feat = self.norm1(input)
+        x_feat = self.norm1(input)                          # [2, 3600, 512]
         x_feat = input + self.dropout(self.attention(x_feat))
         y_feat = self.norm2(x_feat)
-        x_feat = x_feat + self.ffn(y_feat)
+        x_feat = x_feat + self.ffn(y_feat)                  # [2, 3600, 512]
 
-        x_sem_feat = self.norm1_sem(input_sem)
+        x_sem_feat = self.norm1_sem(input_sem)              # [2, 3600, 512]
         x_sem_feat = input_sem + self.dropout_sem(self.attention(x_sem_feat))
         y_sem_feat = self.norm2_sem(x_sem_feat)
-        x_sem_feat = x_sem_feat + self.ffn_sem(y_sem_feat)
+        x_sem_feat = x_sem_feat + self.ffn_sem(y_sem_feat)  # [2, 3600, 512]
 
         x = self.sc(x_feat, t)
         x = enc_feat + x
         x = self.decoder(x)
-        x = torch.tanh(x)
+        x = torch.tanh(x)                 # [10, 3, 60, 108]
 
         x_sem = self.sc(x_sem_feat, t)
         x_sem = enc_feat_sem + x_sem
         x_sem = self.decoder_sem(x_sem)
-        x_sem = torch.tanh(x_sem)   # [20, 60, 108, 3]
+        x_sem = torch.tanh(x_sem)         # [bt, 3, w//4, h//4]
 
-        x_sem_encoded = self.to_ndim(x_sem.permute(0, 3, 2, 1)).permute(0, 2, 1, 3)  # [bt, w, h, N] -> [bt, h, w, N])
+        print('x sem before ndim', x_sem.size())
 
-        x = self.swap(x, x_sem_encoded, masks)  # [bt, 3, 60, 108]
-        x = self.encoder_to_final_size(x)  # [bt, 3, 240, 432]
+        x_sem_ndim = self.to_ndim(x_sem.permute(0, 3, 2, 1)).permute(0, 2, 1, 3)  # [bt, 3, w//4, h//4] -> [bt, h//4, w//4, N])
 
-        x_sem = self.encoder_to_final_size_sem(x_sem)  # [20, 3, 60, 108] -> [20, 3, 240, 432]
+        x = self.swap(x, x_sem_ndim, masks)  # [bt, 3,  60, 108]
+        x = self.decoder_to_final_size(x)    # [bt, 3, 240, 432]
+
+        x_sem = self.decoder_to_final_size_sem(x_sem)  # [20, 3, 60, 108] -> [20, 3, 240, 432]
         x_sem = self.to_ndim(x_sem.permute(0, 3, 2, 1)).permute(0, 3, 2, 1).float()  # [20, 133, 240, 432]
 
-        return x_feat, x_sem_feat, x, x_sem
+        return x, x_sem
 
 
 # ############################ SWAP BLOCK ################################

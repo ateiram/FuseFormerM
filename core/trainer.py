@@ -217,6 +217,7 @@ class Trainer():
 
             frames, masks, semantic_maps, masks_resized = frames.to(device), masks.to(device), semantic_maps.to(device), masks_resized.to(device)
             b, t, c, h, w = frames.size()
+
             #
             # print('frames',frames[0,0,:,0,0])  # [-0.1686,  0.0039, -0.2706]
             # print('semantic_maps',semantic_maps[0, 0, :, 0, 0])  # [-1.0000, -1.0000,  0.2000])
@@ -224,14 +225,14 @@ class Trainer():
 
             masked_frame = (frames * (1 - masks).float())
             masked_semantic_map = (semantic_maps * (1 - masks).float())
-            pred_img_list, pred_map_list = self.netG(masked_frame,
+            pred_img, pred_map_list = self.netG(masked_frame,
                                                      masked_semantic_map,
-                                                     masks_resized.view(b * t, 1, int(h/4), int(w/4)))
+                                                     masks_resized.view(b * t, 1, h//4, w//4))
 
             # print(pred_map_list[0].size())  # [20, 133, 240, 432]
-            # print(pred_img_list[0].size())  # [20, 3, 240, 432]
+            # print(pred_img_list[0].size())  # [20,   3, 240, 432]
 
-            pred_img = pred_img_list[1]
+            # pred_img = pred_img_list[1]
             frames = frames.view(b * t, c, h, w)
             masks = masks.view(b * t, 1, h, w)
             semantic_maps = semantic_maps.view(b * t, 3, h, w)
@@ -277,6 +278,7 @@ class Trainer():
 
             print('sem map shape before loss', semantic_maps.size())  # [20, 240, 432]
             print('pred map shape before loss', pred_map_list[0].size())  # [20, 133, 240, 432]
+
             sem_map_loss = self.cross_ent_loss(pred_map_list[0], semantic_maps)
             + self.cross_ent_loss(pred_map_list[1], semantic_maps)
 

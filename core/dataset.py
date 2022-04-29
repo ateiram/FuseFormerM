@@ -41,7 +41,7 @@ class Dataset(torch.utils.data.Dataset):
             item = self.load_item(0)
         return item
 
-    def create_color_map():
+    def create_color_map(self):
         predefined_list = [0, 51, 102, 153, 204, 255]
         initial_list = [value for value in predefined_list]
         tuples = list(product(initial_list, repeat=3))
@@ -72,9 +72,6 @@ class Dataset(torch.utils.data.Dataset):
             sem_img = Image.open(all_semantic_maps[idx]).convert('RGB')
             sem_img = sem_img.resize(self.size, resample=0)
             semantic_maps.append(sem_img)
-
-            # print('mask_shape', all_masks[idx].resize((60,108), resample=0).size) (60, 108)
-            # print('mask', np.asarray(all_masks[idx].resize((60, 108), resample=0)))
             # to give to swap module, for not to resize while in a batch
             mask_resized = all_masks[idx].resize((60, 108), resample=0)  # (60, 108)
             masks_resized.append(mask_resized)
