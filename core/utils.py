@@ -219,12 +219,13 @@ if __name__ == '__main__':
 
 
 class To_ndim(nn.Module):
-    def __init__(self):
+    def __init__(self, device = None):
         super(To_ndim, self).__init__()
         predefined_list = [0 / 255, 51 / 255, 102 / 255, 153 / 255, 204 / 255, 255 / 255]
         tuples = list(product(predefined_list, repeat=3))
         tuples.remove((0, 0, 0))
         self.color_map = np.asarray(tuples[0:133])
+        self.device = device
 
     def forward(self, S):
         _, c, h, w = S.shape
@@ -239,7 +240,7 @@ class To_ndim(nn.Module):
 
         bt, w, h, c = S.shape
 
-        C = torch.Tensor(self.color_map).view((1, 1, 1, c, N))  # [1, 1, 1, c, N]
+        C = torch.Tensor(self.color_map).view((1, 1, 1, c, N)).to(self.device) # [1, 1, 1, c, N]
         mad = torch.abs(C - S.unsqueeze(dim=-1))  # [bt, w, h, c, N]
         mae = mad.sum(-2)  # [bt, w, h, N]
         ind = torch.argmin(mae, -1)  # [bt, w, h]

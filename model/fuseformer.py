@@ -11,6 +11,7 @@ import torchvision.models as models
 from core.spectral_norm import spectral_norm as _spectral_norm
 from itertools import product
 from core.utils import To_ndim
+from core.dist import get_local_rank
 
 class BaseNetwork(nn.Module):
     def __init__(self):
@@ -128,25 +129,30 @@ class InpaintGenerator(BaseNetwork):
         for i, d in enumerate(kernel_size):
             n_vecs *= int((output_size[i] + 2 * padding[i] - (d - 1) - 1) / stride[i] + 1)
 
+        local_rank = get_local_rank()
+
+        if torch.cuda.is_available():
+            device = torch.device("cuda:{}".format(local_rank))
+        else:
+            device = 'cpu'
 
         for _ in range(stack_num):  # 3
             blocks.append(TransformerBlock(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
-                                           t2t_params=t2t_params))
+                                           t2t_params=t2t_params, device = device))
         for _ in range(stack_num_swap):  # 2
             blocks.append(TransformerBlockSWAP(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
-                                               t2t_params=t2t_params))
+                                               t2t_params=t2t_params, device = device))
         for _ in range(stack_num):  # 3
             blocks.append(TransformerBlock(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
-                                           t2t_params=t2t_params))
+                                           t2t_params=t2t_params, device = device))
         self.transformer = blocks
         self.ss = SoftSplit(channel // 2, hidden, kernel_size, stride, padding, dropout=dropout)
         self.add_pos_emb = AddPosEmb(n_vecs, hidden)
-        self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
+        self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding, device=device)
         self.stack_num = stack_num
         self.stack_num_swap = stack_num_swap
 
         self.encoder = Encoder()
-        self.to_ndim = To_ndim()
 
         # decoder: decode frames from features
         self.decoder = nn.Sequential(
@@ -183,7 +189,7 @@ class InpaintGenerator(BaseNetwork):
         for block in self.transformer[0:3]:  # 0, 1, 2
             trans_feat, trans_feat_sem = block(trans_feat, trans_feat_sem)
 
-        for block in self.transformer[3:4]:  # 3
+        for block in [self.transformer[3]]:  # 3
             trans_comp, trans_comp_sem = block(enc_feat_sem,
                                                enc_feat,
                                                trans_feat,
@@ -197,7 +203,7 @@ class InpaintGenerator(BaseNetwork):
             trans_feat = self.ss(enc_feat, b)
             trans_feat = self.add_pos_emb(trans_feat)
 
-        for block in self.transformer[4:5]:    # 4
+        for block in [self.transformer[4]]:    # 4
             trans_comp, trans_comp_sem = block(enc_feat_sem,
                                                enc_feat,
                                                trans_feat,
@@ -235,12 +241,12 @@ class deconv(nn.Module):
 
 
 class deconvSWAP(nn.Module):
-    def __init__(self, input_channel, output_channel, kernel_size=3, padding=0, scale_factor=1, mode='bilinear'):
+    def __init__(self, input_channel, output_channel, kernel_size=3, padding=0, scale_factor=1, mode='bilinear', device=None):
         super().__init__()
         self.mode = mode
         self.scale_factor = scale_factor
         self.conv = nn.Conv2d(input_channel, output_channel,
-                              kernel_size=kernel_size, stride=1, padding=padding)
+                              kernel_size=kernel_size, stride=1, padding=padding, device=device)
 
     def forward(self, x):
         if self.mode == 'nearest':
@@ -307,20 +313,22 @@ class SoftSplit(nn.Module):
 
 
 class SoftComp(nn.Module):
-    def __init__(self, channel, hidden, output_size, kernel_size, stride, padding):
+    def __init__(self, channel, hidden, output_size, kernel_size, stride, padding, device=None):
         super(SoftComp, self).__init__()
         self.relu = nn.LeakyReLU(0.2, inplace=True)
         c_out = reduce((lambda x, y: x * y), kernel_size) * channel
-        self.embedding = nn.Linear(hidden, c_out)
+        self.embedding = nn.Linear(hidden, c_out, device=device)
         self.t2t = torch.nn.Fold(output_size=output_size, kernel_size=kernel_size, stride=stride, padding=padding)
         h, w = output_size
+        self.device = device
         self.bias = nn.Parameter(torch.zeros((channel, h, w), dtype=torch.float32), requires_grad=True)
 
     def forward(self, x, t):
         feat = self.embedding(x)
         b, n, c = feat.size()
         feat = feat.view(b * t, -1, c).permute(0, 2, 1)
-        feat = self.t2t(feat) + self.bias[None]
+        feat = self.t2t(feat) + self.bias[None].to(self.device)
+
         return feat
 
 
@@ -329,12 +337,12 @@ class MultiHeadedAttention(nn.Module):
     Take in model size and number of heads.
     """
 
-    def __init__(self, d_model, head, p=0.1):
+    def __init__(self, d_model, head, p=0.1, device = None):
         super().__init__()
-        self.query_embedding = nn.Linear(d_model, d_model)
-        self.value_embedding = nn.Linear(d_model, d_model)
-        self.key_embedding = nn.Linear(d_model, d_model)
-        self.output_linear = nn.Linear(d_model, d_model)
+        self.query_embedding = nn.Linear(d_model, d_model,  device = device)
+        self.value_embedding = nn.Linear(d_model, d_model,  device = device)
+        self.key_embedding = nn.Linear(d_model, d_model,  device = device)
+        self.output_linear = nn.Linear(d_model, d_model,  device = device)
         self.attention = Attention(p=p)
         self.head = head
 
@@ -369,16 +377,16 @@ class FeedForward(nn.Module):
 
 
 class FusionFeedForward(nn.Module):
-    def __init__(self, d_model, p=0.1, n_vecs=None, t2t_params=None):
+    def __init__(self, d_model, p=0.1, n_vecs=None, t2t_params=None, device = None):
         super(FusionFeedForward, self).__init__()
         # We set d_ff as a default to 1960
         hd = 1960
         self.conv1 = nn.Sequential(
-            nn.Linear(d_model, hd))
+            nn.Linear(d_model, hd, device = device))
         self.conv2 = nn.Sequential(
             nn.ReLU(inplace=True),
             nn.Dropout(p=p),
-            nn.Linear(hd, d_model),
+            nn.Linear(hd, d_model, device = device),
             nn.Dropout(p=p))
         assert t2t_params is not None and n_vecs is not None
         tp = t2t_params.copy()
@@ -403,18 +411,18 @@ class TransformerBlock(nn.Module):
     Transformer = MultiHead_Attention + Feed_Forward with sublayer connection
     """
 
-    def __init__(self, hidden=128, num_head=4, dropout=0.1, n_vecs=None, t2t_params=None):
+    def __init__(self, hidden=128, num_head=4, dropout=0.1, n_vecs=None, t2t_params=None, device = None):
         super().__init__()
-        self.attention = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout)
-        self.ffn = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params)
-        self.norm1 = nn.LayerNorm(hidden)
-        self.norm2 = nn.LayerNorm(hidden)
+        self.attention = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout, device = device)
+        self.ffn = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params, device = device)
+        self.norm1 = nn.LayerNorm(hidden, device = device)
+        self.norm2 = nn.LayerNorm(hidden, device = device)
         self.dropout = nn.Dropout(p=dropout)
 
-        self.attention_sem = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout)
-        self.ffn_sem = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params)
-        self.norm1_sem = nn.LayerNorm(hidden)
-        self.norm2_sem = nn.LayerNorm(hidden)
+        self.attention_sem = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout, device = device)
+        self.ffn_sem = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params, device = device)
+        self.norm1_sem = nn.LayerNorm(hidden, device = device)
+        self.norm2_sem = nn.LayerNorm(hidden, device = device)
         self.dropout_sem = nn.Dropout(p=dropout)
 
     def forward(self, input, input_sem):
@@ -437,63 +445,63 @@ class TransformerBlockSWAP(nn.Module):
     Transformer = MultiHead_Attention + Feed_Forward with sublayer connection
     """
     def __init__(self, hidden=128, num_head=4, dropout=0.1, n_vecs=None, t2t_params=None,
-                 channel=256, kernel_size=(7, 7), padding=(3, 3), stride=(3, 3), output_size=(60, 108)):
+                 channel=256, kernel_size=(7, 7), padding=(3, 3), stride=(3, 3), output_size=(60, 108), device=None):
         super().__init__()
 
-        self.attention = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout)
-        self.ffn = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params)
-        self.norm1 = nn.LayerNorm(hidden)
-        self.norm2 = nn.LayerNorm(hidden)
+        self.attention = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout, device=device)
+        self.ffn = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params, device=device)
+        self.norm1 = nn.LayerNorm(hidden, device=device)
+        self.norm2 = nn.LayerNorm(hidden, device=device)
         self.dropout = nn.Dropout(p=dropout)
 
-        self.attention_sem = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout)
-        self.ffn_sem = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params)
-        self.norm1_sem = nn.LayerNorm(hidden)
-        self.norm2_sem = nn.LayerNorm(hidden)
+        self.attention_sem = MultiHeadedAttention(d_model=hidden, head=num_head, p=dropout, device=device)
+        self.ffn_sem = FusionFeedForward(hidden, p=dropout, n_vecs=n_vecs, t2t_params=t2t_params, device=device)
+        self.norm1_sem = nn.LayerNorm(hidden, device=device)
+        self.norm2_sem = nn.LayerNorm(hidden, device=device)
         self.dropout_sem = nn.Dropout(p=dropout)
 
         # decoder: decode frames from features
         self.decoder = nn.Sequential(
-            deconvSWAP(channel // 2, 128, kernel_size=3, padding=1),
+            deconvSWAP(channel // 2, 128, kernel_size=3, padding=1, device=device),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1, device=device),
             nn.LeakyReLU(0.2, inplace=True),
-            deconvSWAP(64, 64, kernel_size=3, padding=1),
+            deconvSWAP(64, 64, kernel_size=3, padding=1, device=device),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
+            nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1, device=device)
         )
 
         self.decoder_sem = nn.Sequential(
-            deconvSWAP(channel // 2, 128, kernel_size=3, padding=1, mode='nearest'),
+            deconvSWAP(channel // 2, 128, kernel_size=3, padding=1, mode='nearest', device=device),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1, device=device),
             nn.LeakyReLU(0.2, inplace=True),
-            deconvSWAP(64, 64, kernel_size=3, padding=1, mode='nearest'),
+            deconvSWAP(64, 64, kernel_size=3, padding=1, mode='nearest', device=device),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
+            nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1, device=device)
         )
 
         self.decoder_to_final_size = nn.Sequential(
-            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2),
+            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2, device=device),
             nn.LeakyReLU(0.2, inplace=True),
-            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2),
+            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2, device=device),
             nn.LeakyReLU(0.2, inplace=True)
         )
 
         self.decoder_to_final_size_sem = nn.Sequential(
-            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2, mode='nearest'),
+            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2, mode='nearest', device=device),
             nn.LeakyReLU(0.2, inplace=True),
-            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2, mode='nearest'),
+            deconvSWAP(3, 3, kernel_size=3, padding=1, scale_factor=2, mode='nearest', device=device),
             nn.LeakyReLU(0.2, inplace=True)
         )
 
         self.add_pos_emb = AddPosEmb(n_vecs, hidden)
         self.add_pos_emb_sem = AddPosEmb(n_vecs, hidden)
-        self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
+        self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding, device=device)
         self.encoder = Encoder()
-        self.to_ndim = To_ndim()
+        self.to_ndim = To_ndim(device=device)
         self.t2t = torch.nn.Fold(output_size=output_size, kernel_size=kernel_size, stride=stride, padding=padding)
-        self.swap = SWAP()
+        self.swap = SWAP(device=device)
         self.output_size = output_size
 
     def forward(self, enc_feat_sem, enc_feat, input, input_sem, t, masks):
@@ -517,15 +525,13 @@ class TransformerBlockSWAP(nn.Module):
         x_sem = self.decoder_sem(x_sem)
         x_sem = torch.tanh(x_sem)         # [bt, 3, w//4, h//4]
 
-        print('x sem before ndim', x_sem.size())
-
         x_sem_ndim = self.to_ndim(x_sem.permute(0, 3, 2, 1)).permute(0, 2, 1, 3)  # [bt, 3, w//4, h//4] -> [bt, h//4, w//4, N])
 
         x = self.swap(x, x_sem_ndim, masks)  # [bt, 3,  60, 108]
         x = self.decoder_to_final_size(x)    # [bt, 3, 240, 432]
 
         x_sem = self.decoder_to_final_size_sem(x_sem)  # [20, 3, 60, 108] -> [20, 3, 240, 432]
-        print(x_sem[0,0,:,:])
+
         x_sem = self.to_ndim(x_sem.permute(0, 3, 2, 1)).permute(0, 3, 2, 1).float()  # [20, 133, 240, 432]
 
         return x, x_sem
@@ -534,7 +540,7 @@ class TransformerBlockSWAP(nn.Module):
 # ############################ SWAP BLOCK ################################
 
 class SWAP(nn.Module):
-    def __init__(self, k=12, stride=(12, 12), padding=(0, 0), N=133):
+    def __init__(self, k=12, stride=(12, 12), padding=(0, 0), N=133, device = None):
         super(SWAP, self).__init__()
         self.k = k
         self.N = N
@@ -543,6 +549,7 @@ class SWAP(nn.Module):
         self.unfold = nn.Unfold(kernel_size=(k, k), stride=stride, padding=padding)
         self.fold = nn.Fold(output_size=(60, 108), kernel_size=(k, k), stride=stride, padding=padding)
         self.softmax = nn.Softmax(dim=-1)
+        self.device = device
 
 
     def forward(self, I, S, M):
@@ -567,12 +574,12 @@ class SWAP(nn.Module):
 
         W = W.unsqueeze(-1).permute(0, 3, 1, 2)
         K = K.unsqueeze(-2)
-        WK = torch.sum(W * K, -1)
+        WK = torch.sum(W*K, -1)
 
         output = self.fold(WK)
-        output = output.view(bt, N, 3, h // 4, w // 4).sum(1)
+        output = output.view(bt, N, 3, h // 4, w // 4).sum(1).to(self.device)
         output = orig_I * (1 - orig_M) + output * orig_M
-        print(output.size())
+
         return output
 
 # ######################################################################
