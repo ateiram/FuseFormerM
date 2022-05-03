@@ -138,13 +138,13 @@ class InpaintGenerator(BaseNetwork):
 
         for _ in range(stack_num):  # 3
             blocks.append(TransformerBlock(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
-                                           t2t_params=t2t_params, device = device))
+                                           t2t_params=t2t_params, device=device))
         for _ in range(stack_num_swap):  # 2
             blocks.append(TransformerBlockSWAP(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
-                                               t2t_params=t2t_params, device = device))
+                                               t2t_params=t2t_params, device=device))
         for _ in range(stack_num):  # 3
             blocks.append(TransformerBlock(hidden=hidden, num_head=num_head, dropout=dropout, n_vecs=n_vecs,
-                                           t2t_params=t2t_params, device = device))
+                                           t2t_params=t2t_params, device=device))
         self.transformer = blocks
         self.ss = SoftSplit(channel // 2, hidden, kernel_size, stride, padding, dropout=dropout)
         self.add_pos_emb = AddPosEmb(n_vecs, hidden)
@@ -517,18 +517,19 @@ class TransformerBlockSWAP(nn.Module):
 
         x = self.sc(x_feat, t)
         x = enc_feat + x
-        x = self.decoder(x)
-        x = torch.tanh(x)                 # [10, 3, 60, 108]
+        x = (self.decoder(x) + 1)/2
+        # x = torch.tanh(x)                 # [10, 3, 60, 108]
 
         x_sem = self.sc(x_sem_feat, t)
         x_sem = enc_feat_sem + x_sem
-        x_sem = self.decoder_sem(x_sem)
-        x_sem = torch.tanh(x_sem)         # [bt, 3, w//4, h//4]
+        x_sem = (self.decoder_sem(x_sem) + 1)/2
+        # x_sem = torch.tanh(x_sem)       # [bt, 3, w//4, h//4]
+        # print('x_sem_ndim before swap', x_sem[0, 0, :, 65])
 
         x_sem_ndim = self.to_ndim(x_sem.permute(0, 3, 2, 1)).permute(0, 2, 1, 3)  # [bt, 3, w//4, h//4] -> [bt, h//4, w//4, N])
 
         x = self.swap(x, x_sem_ndim, masks)  # [bt, 3,  60, 108]
-        x = self.decoder_to_final_size(x)    # [bt, 3, 240, 432]
+        x = self.decoder_to_final_size(x*2-1)    # [bt, 3, 240, 432]
 
         x_sem = self.decoder_to_final_size_sem(x_sem)  # [20, 3, 60, 108] -> [20, 3, 240, 432]
 
