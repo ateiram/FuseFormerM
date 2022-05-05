@@ -168,9 +168,12 @@ class InpaintGenerator(BaseNetwork):
         if init_weights:
             self.init_weights()
 
-    def forward(self, masked_frames, masked_semantic_maps, masks):
+    def forward(self, masked_frames, masked_semantic_maps, masks, frames_res, semantic_maps_res):
         # extracting features
         b, t, c, h, w = masked_frames.size()  # [2, 5, 3, 240, 432]
+        semantic_maps_res = semantic_maps_res.view(b * t, c, h//4, w//4)
+        frames_res = frames_res.view(b * t, c, h//4, w//4)
+
         time0 = time.time()
 
         enc_feat = self.encoder(masked_frames.view(b * t, c, h, w))  # [10, 128, 60, 108]
@@ -194,7 +197,9 @@ class InpaintGenerator(BaseNetwork):
                                                enc_feat,
                                                trans_feat,
                                                trans_feat_sem,
-                                               t, masks)
+                                               t, masks,
+                                               frames_res, semantic_maps_res
+                                               )
         sem_results.append(trans_comp_sem)
         img_results.append(trans_comp)
 
@@ -208,7 +213,9 @@ class InpaintGenerator(BaseNetwork):
                                                enc_feat,
                                                trans_feat,
                                                trans_feat_sem,
-                                               t, masks)
+                                               t, masks,
+                                               frames_res, semantic_maps_res
+                                               )
         sem_results.append(trans_comp_sem)
         img_results.append(trans_comp)
 
@@ -504,7 +511,7 @@ class TransformerBlockSWAP(nn.Module):
         self.swap = SWAP(device=device)
         self.output_size = output_size
 
-    def forward(self, enc_feat_sem, enc_feat, input, input_sem, t, masks):
+    def forward(self, enc_feat_sem, enc_feat, input, input_sem, t, masks, frames_res, semantic_maps_res):
         x_feat = self.norm1(input)                          # [2, 3600, 512]
         x_feat = input + self.dropout(self.attention(x_feat))
         y_feat = self.norm2(x_feat)
@@ -524,11 +531,16 @@ class TransformerBlockSWAP(nn.Module):
         x_sem = enc_feat_sem + x_sem
         x_sem = (self.decoder_sem(x_sem) + 1)/2
         # x_sem = torch.tanh(x_sem)       # [bt, 3, w//4, h//4]
+        semantic_maps_res = semantic_maps_res
+        frames_res = frames_res
+
         # print('x_sem_ndim before swap', x_sem[0, 0, :, 65])
+        # print('x_sem_ndim_orig before swap', semantic_maps_res[0, 0, :, 65])
 
         x_sem_ndim = self.to_ndim(x_sem.permute(0, 3, 2, 1)).permute(0, 2, 1, 3)  # [bt, 3, w//4, h//4] -> [bt, h//4, w//4, N])
+        x_sem_ndim_orig = self.to_ndim(semantic_maps_res.permute(0, 3, 2, 1)).permute(0, 2, 1, 3)
 
-        x = self.swap(x, x_sem_ndim, masks)  # [bt, 3,  60, 108]
+        x = self.swap(x,  x_sem_ndim, masks, frames_res, x_sem_ndim_orig)  # [bt, 3,  60, 108]
         x = self.decoder_to_final_size(x*2-1)    # [bt, 3, 240, 432]
 
         x_sem = self.decoder_to_final_size_sem(x_sem)  # [20, 3, 60, 108] -> [20, 3, 240, 432]
@@ -553,14 +565,15 @@ class SWAP(nn.Module):
         self.device = device
 
 
-    def forward(self, I, S, M):
+    def forward(self, I, S, M, I_init, S_init):
         orig_I, orig_S, orig_M = I.float(), S.float(), M.float()
-        I, S, M = orig_I.unsqueeze(-1), orig_S.unsqueeze(-1).permute(0, 4, 1, 2, 3), orig_M.unsqueeze(-1)
+        I, S, M, I_i, S_i = orig_I.unsqueeze(-1), orig_S.unsqueeze(-1).permute(0, 4, 1, 2, 3), orig_M.unsqueeze(-1), \
+                  I_init.unsqueeze(-1), S_init.unsqueeze(-1).permute(0, 4, 1, 2, 3)
         bt, N = I.shape[0], self.N
         h, w = 240, 432
 
         U = I * S * M
-        K = I * S * (1 - M)
+        K = I_i * S_i * (1 - M)
 
         K = K.permute(0, 4, 1, 2, 3).reshape(bt * N, 3, h // 4, w // 4)
         U = U.permute(0, 4, 1, 2, 3).reshape(bt * N, 3, h // 4, w // 4)
@@ -579,7 +592,8 @@ class SWAP(nn.Module):
 
         output = self.fold(WK)
         output = output.view(bt, N, 3, h // 4, w // 4).sum(1).to(self.device)
-        output = orig_I * (1 - orig_M) + output * orig_M
+
+        output = I_init * (1 - orig_M) + output * orig_M
 
         return output
 

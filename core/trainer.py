@@ -45,8 +45,9 @@ class Trainer():
         self.adversarial_loss = AdversarialLoss(type=self.config['losses']['GAN_LOSS'])
         self.adversarial_loss = self.adversarial_loss.to(self.config['device'])
         self.l1_loss = nn.L1Loss()
-        self.cross_ent_loss = torch.nn.CrossEntropyLoss()
-        self.cross_ent_loss = self.cross_ent_loss.to(self.config['device'])
+        self.l1_loss_sem = nn.L1Loss()
+        # self.cross_ent_loss = torch.nn.CrossEntropyLoss()
+        # self.cross_ent_loss = self.cross_ent_loss.to(self.config['device'])
 
         # setup models including generator and discriminator
         net = importlib.import_module('model.' + config['model']['net'])
@@ -212,11 +213,13 @@ class Trainer():
     def _train_epoch(self, pbar):
         device = self.config['device']
 
-        for frames, masks, semantic_maps, masks_resized in self.train_loader:
+        for frames, masks, semantic_maps, masks_resized, frames_res, semantic_maps_res in self.train_loader:
             self.adjust_learning_rate()
             self.iteration += 1
 
-            frames, masks, semantic_maps, masks_resized = frames.to(device), masks.to(device), semantic_maps.to(device), masks_resized.to(device)
+            frames, masks, semantic_maps, masks_resized, frames_res, semantic_maps_res = frames.to(device), masks.to(device), \
+                                                          semantic_maps.to(device), masks_resized.to(device),\
+                                                          frames_res.to(device), semantic_maps_res.to(device)
             b, t, c, h, w = frames.size()
 
             #
@@ -228,7 +231,9 @@ class Trainer():
             masked_semantic_map = (semantic_maps * (1 - masks).float())
             pred_img, pred_map_list = self.netG(masked_frame,
                                                      masked_semantic_map,
-                                                     masks_resized.view(b * t, 1, h//4, w//4))
+                                                     masks_resized.view(b * t, 1, h//4, w//4),
+                                                frames_res, semantic_maps_res
+                                                )
 
             # print(pred_map_list[0].size())  # [20, 133, 240, 432]
             # print(pred_img_list[0].size())  # [20,   3, 240, 432]
@@ -276,17 +281,39 @@ class Trainer():
             # TODO check shapes for all outputs that are going inside cross entropy loss
             to_ndim = To_ndim(device=device)
             # print((semantic_maps[0,0,:,0]+1)/2, 'sem map before loss GT')
-            semantic_maps = to_ndim((semantic_maps.permute(0, 2, 3, 1)+1)/2)
+
+
+            # print(pred_map_list[1].size(), 'pred_map_list[1].size()')
+            # print(semantic_maps.size(), 'semantic_maps.size()')
+
+
+            semantic_maps = to_ndim((semantic_maps.permute(0, 2, 3, 1) + 1) / 2)
             semantic_maps = torch.argmax(semantic_maps, -1)
+            semantic_maps_pred = torch.argmax(pred_map_list[1].permute(0, 2, 3, 1), -1)
 
-            print('sem map shape before loss', semantic_maps.size())  # [20, 240, 432]
-            print('pred map shape before loss', pred_map_list[0].size())  # [20, 133, 240, 432]
+            # print("****", pred_map_list[1].size())
+            # semantic_maps_pred = to_ndim((pred_map_list[1].permute(0, 2, 3, 1) + 1) / 2)
+            # semantic_maps_pred = torch.argmax(semantic_maps_pred, -1)
 
-            sem_map_loss = 0.1 * (self.cross_ent_loss(pred_map_list[0], semantic_maps)
-            + self.cross_ent_loss(pred_map_list[1], semantic_maps))
+            # sem_map_pred = pred_map_list[1].size()
 
+            # print('sem map shape before loss', semantic_maps.size())  # [20, 240, 432]
+            # print('pred map shape before loss', pred_map_list[0].size())  # [20, 133, 240, 432]
 
+            # sem_map_loss = 0.1 * (self.cross_ent_loss(pred_map_list[0], semantic_maps)
+            # + self.cross_ent_loss(pred_map_list[1], semantic_maps))
+            # print("*")
+            #
+            # gen_loss += sem_map_loss
+            print('seizes')
+            print(semantic_maps_pred.size())
+            print(semantic_maps.size())
+
+            sem_map_loss = 0.1 * self.l1_loss_sem(semantic_maps_pred * (1 - masks), semantic_maps * (1 - masks))
             gen_loss += sem_map_loss
+            self.add_summary(
+                self.gen_writer, 'loss/semantic_loss', sem_map_loss.item())
+
 
             valid_loss = self.l1_loss(pred_img * (1 - masks), frames * (1 - masks))
             valid_loss = valid_loss / torch.mean(1 - masks) * self.config['losses']['valid_weight']
